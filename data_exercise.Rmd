@@ -1,0 +1,730 @@
+---
+title: "Data Analytics Manager"
+subtitle: "Data Exercise"
+author: "Matthew Schuelke"
+output:
+  html_document:
+    css: edu.wustl.i2db.css
+    includes:
+      before_body: before_body.htm
+    toc: true
+    toc_float: true
+date: "2025-10-29"
+params:
+  fit: FALSE
+  cache: FALSE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+
+library(AER)
+library(DHARMa)
+library(dplyr)
+library(ggplot2)
+library(glmmTMB)
+library(gt)
+library(hms)
+library(lubridate)
+library(readr)
+library(sf)
+library(sjPlot)
+library(stringr)
+library(tidycensus)
+library(tidyr)
+library(tigris)
+```
+
+# Project Description
+
+The St. Louis Metropolitan Police Department utilizes the National Incident Based Reporting System (NIBRS) to collect and track crime data. NIBRS captures details on each single crime incident—as well as on separate offenses within the same incident.
+
+Explore the relationship between type of crime, neighborhoods, and seasons.
+
+Review the topic and the publicly available data below. Use descriptive or exploratory statistics to demonstrate your review process. Build two (2) multivariate models exploring relationships within the topic. Please share code that you used to manipulate the data, create new variables, etc. when you submit the exercise results.
+
+For the scheduled debrief: Prepare to explain the statistical models you used, why you selected them, and how you assessed model fit and assumptions. Describe your thought process, results and conclusions.
+
+# Research
+
+I first explored the police department website for information about the data and its generating process. I was interested in finding a data dictionary as well as any other available information. While I did not come across a dictionary, I did find the frequently asked question document as well as links to FBI pages with some additional information.
+
+Some of my findings included:
+
+1. Definitions for concepts like calls for service, incident reports and crime. 
+2. The retirement of UCR Summary Reporting (SRS) in favor of NIBRS and their relationship.
+3. When and how data is supplemented and updated.
+4. How victim number is unique within incident but not across for de-identification purposes.
+5. What "unfounded" means for a given incident.
+
+# Import NIBRS Data
+
+```{r}
+if(params$cache) {
+  # read data as string
+  nibrs_data_raw <- read_csv(
+    "https://slmpd.org/wp-content/uploads/2024/03/2021-2023.csv",
+    col_types = cols(.default = "c"),
+    na = "NULL"
+  )
+
+  # save cache
+  saveRDS(nibrs_data_raw, "nibrs_data_raw.rds")
+}
+
+# load cache
+nibrs_data_raw <- readRDS("nibrs_data_raw.rds")
+```
+
+I imported the data as raw characters to avoid loosing any information due to implicit casting.
+
+I then examined each column individually looking for anomalies and making sure I could cast each to an appropriate data type. I used regular expressions to identify patterns for validation purposes. I then used univariate statistics and visualizations such as histograms to get an understanding of each column. I also checked for missing data.
+
+I did not include this code here because it is not very interesting.
+
+Some highlights that I found included:
+
+```{r}
+nibrs_data_raw %>% 
+  transmute(IncidentDate = as_date(IncidentDate)) %>% 
+  count(IncidentDate < "2021-01-01") %>% 
+  mutate(p = 100 * round(n / sum(n), 4)) %>% 
+  gt()
+```
+
+1,044 or a little more than a half percent of the data had incident dates prior to what I expected in the file.
+
+```{r}
+nibrs_data_raw %>% 
+  select(Neighborhood) %>% 
+  count(Neighborhood == "NA (Outside City)") %>% 
+  mutate(p = 100 * round(n / sum(n), 4)) %>% 
+  gt()
+```
+
+
+127 offenses were listed as having occurred outside the city.
+
+1,219 or a bit more than half a percent of the offenses were not ascribed to a neighborhood.
+
+My understanding of the data at this point is offense level data is nested within incidents and associated incident-level data which are nested within neighborhoods.
+
+I keyed in on columns for:
+
+1. incident date (for project time component - especially season)
+2. incident number (model at the offense or incident level)
+3. offense description (considered for the project type of crime component)
+4. NIBRS class (considered for the project type of crime component)
+5. offense classification (considered for the project type of crime component)
+6. neighborhood (for the project neighborhood component)
+
+# Models Under Consideration
+
+1. Logistic regression
+2. Poisson regression
+3. Negative Binomial regression
+3. Multinomial regression
+4. AutoRegressive Integrated Moving Average (ARIMA)
+5. Hierarchical/mixed model variants of the above
+
+I choose to start with something simple and chose Poisson. I then thought it might be good to get some outside data in case I decided to use an offset to control for exposure.
+
+# Import GIS Data
+
+I decided to retrieve data from:
+
+1. American Community Survey
+2. Area Deprivation Index
+
+```{r}
+# read shape file
+neighborhood_shapes <- sf::st_read("Neighborhoods/Neighborhoods.shp") %>% 
+  sf::st_transform(crs = 4326)
+
+# calculate neighborhood areas
+neighborhood_shapes$area_km2 <- neighborhood_shapes %>% 
+  sf::st_area() %>% 
+  as.numeric() %>% 
+  { . / 1000^2 }
+
+if(params$cache) {
+  # get 2023 american community survey variables at the block group level via api
+  acs_block_group <- tidycensus::get_acs(
+    geography = "block group",
+    variables = c(
+      total_pop = "B01003_001", 
+      med_hh_income = "B19013_001"
+    ),
+    year = 2023,
+    state = "MO",
+    county = "St. Louis city",
+    geometry = TRUE
+  ) %>% 
+    sf::st_transform(sf::st_crs(neighborhood_shapes))
+
+  # save cache
+  saveRDS(acs_block_group, "acs_block_group.rds")
+}
+
+# load cache
+acs_block_group <- readRDS("acs_block_group.rds")
+
+# pivot wide (eav -> wide)
+acs_block_group_wide <- acs_block_group %>%
+  pivot_wider(
+    id_cols = c(GEOID, NAME, geometry),
+    names_from = variable,
+    values_from = estimate
+  )
+
+# load area deprivation index (no api provided)
+adi <- read_csv(
+  "MO_2023_ADI_Census_Block_Group_v4_0_1.csv", 
+  col_types = cols(.default = "c")
+) %>% 
+  transmute(
+    FIPS,
+    ADI_STATERNK = suppressWarnings( # ADI contains data suppression codes
+      as.numeric(ADI_STATERNK)       # I expect and want these to be NA
+    )                                # so I suppress the warning
+  )
+
+# left join acs wide with adi by block group
+acs_block_group_wide_with_adi <- acs_block_group_wide %>% 
+  left_join(adi, by = join_by(GEOID == FIPS))
+    
+# map block groups to neighborhoods by intersection
+block_group_neighborhood <- acs_block_group_wide_with_adi %>% 
+  sf::st_join(neighborhood_shapes, join = sf::st_intersects)
+
+# aggregate acs and adi data to the neighborhood level
+acs_neighborhood <- block_group_neighborhood %>% 
+  sf::st_drop_geometry() %>%
+  dplyr::group_by(NHD_NAME) %>% 
+  dplyr::summarize(
+    med_hh_income = weighted.mean(med_hh_income, total_pop, na.rm = TRUE),
+    adi_staternk = weighted.mean(ADI_STATERNK, total_pop, na.rm = TRUE),
+    total_pop = sum(total_pop, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# merge shape file data with aggregated census data
+geo_data <- neighborhood_shapes %>%
+  dplyr::left_join(acs_neighborhood, by = c("NHD_NAME")) %>% 
+  dplyr::as_tibble()
+
+# map shape file neighborhood names to nibrs neighborhood names
+geo_data <- geo_data %>% 
+  mutate(NHD_NAME_MAPPED = case_when(
+    NHD_NAME == "Clayton-Tamm"                   ~ "Clayton / Tamm",
+    NHD_NAME == "Forest Park South East"         ~ "Forest Park Southeast",
+    NHD_NAME == "Hi-Pointe"                      ~ "Hi Pointe",
+    NHD_NAME == "Wydown Skinker"                 ~ "Wydown / Skinker",
+    NHD_NAME == "Covenant Blu-Grand Center"      ~ "Covenant Blu Grand Center",
+    NHD_NAME == "Old North St. Louis"            ~ "Old North St Louis",
+    NHD_NAME == "St. Louis Place"                ~ "St Louis Place",
+    NHD_NAME == "Jeff Vanderlou"                 ~ "JeffVanderLou",
+    NHD_NAME == "Greater Ville"                  ~ "The Greater Ville",
+    NHD_NAME == "Fairground Neighborhood"        ~ "Fairground",
+    NHD_NAME == "St. Louis Hills"                ~ "St Louis Hills",
+    NHD_NAME == "Missouri Botanical Garden"      ~ "The Botanical Garden",
+    NHD_NAME == "LaSalle Park"                   ~ "Lasalle Park",
+    NHD_NAME == "O'Fallon"                       ~ "OFallon",
+    NHD_NAME == "O'Fallon Park"                  ~ "OFallon Park",
+    NHD_NAME == "Mark Twain I-70 Industrial"     ~ "Mark Twain / I 70 Industrial",
+    NHD_NAME == "Bellefontaine/Calvary Cemetery" ~ "Cal-Bel Cemetery",
+    NHD_NAME == "Skinker DeBaliviere"            ~ "Skinker / DeBaliviere",
+    .default = NHD_NAME
+  )
+)
+```
+
+# Data Transformations
+
+```{r}
+data <- nibrs_data_raw %>% 
+  left_join(geo_data, by = join_by(Neighborhood == NHD_NAME_MAPPED)) %>% 
+  mutate(
+    incident_date = as_date(IncidentDate),
+    month_day = format(incident_date, "%m-%d"),
+    season = case_when(
+      month_day >= "12-21" | month_day < "03-20" ~ "Winter",
+      month_day >= "03-20" & month_day < "06-21" ~ "Spring",
+      month_day >= "06-21" & month_day < "09-22" ~ "Summer",
+      month_day >= "09-22" & month_day < "12-21" ~ "Autumn",
+      TRUE ~ NA_character_
+    ) %>% 
+      factor(levels = c("Summer", "Autumn", "Winter", "Spring")),
+    type = if_else(FelMisdCit %in% c("C", "M", "F"), FelMisdCit, "O") %>% 
+      factor(levels = c("O", "C", "M", "F")),
+    year = year(IncidentDate),
+    neighborhood = Neighborhood,
+    log_density = log(total_pop / area_km2)
+  ) %>% 
+  filter(
+    IncidentDate >= "2021-01-01",       # 1044 / 180138 (0.58%) pre 2021 rows
+    !is.na(Neighborhood),               # 1219 / 180138 (0.68%) missing
+    Neighborhood != "NA (Outside City)" #  127 / 180138 (0.07%) outside
+  ) %>%
+  select(
+    neighborhood,
+    season,
+    year,
+    type,
+    log_density,
+    adi_staternk
+  ) %>% 
+  count(
+    neighborhood, 
+    season, 
+    year, 
+    type, 
+    log_density, 
+    adi_staternk, 
+    name = "offense_count"
+  )
+```
+
+Highlights of the data transformations include:
+
+1. Joined the GIS data to the NIBRS data by neighborhood
+2. Performed variable transformations such as 
+    - computing a season factor
+    - creating a offense type factor to include felonies, misdemeanors, citations, and other
+    - calculating neighborhood density
+3. Filtered out some of the data
+    - wrong dates
+    - unassigned neighborhoods
+4. counted offenses
+
+```{r}
+crossed_data <- crossing(
+  neighborhood = unique(data$neighborhood),
+  season = unique(data$season),
+  year = unique(data$year),
+  type = unique(data$type)
+) %>% 
+  left_join(
+    data %>% 
+      select(neighborhood, log_density, adi_staternk) %>% 
+      distinct, 
+    by = "neighborhood"
+  ) %>% 
+  left_join(
+    data %>% 
+      select(
+        neighborhood, 
+        season, 
+        year, 
+        type, 
+        offense_count
+      ), 
+    by = c("neighborhood", "season", "year", "type")
+  ) %>%
+  mutate(offense_count = replace_na(offense_count, 0))
+```
+
+I then fully crossed the data I was working with to have explicit 0 counts.
+
+# Model 1. Poisson
+
+```{r}
+if(params$fit) {
+  model_pois <- glm(
+    offense_count ~ season + year + type + log_density + adi_staternk,
+    poisson(link = "log"),
+    crossed_data
+  )
+
+  # save cache
+  saveRDS(model_pois, "model_pois.rds")
+}
+
+# load cache
+model_pois <- readRDS("model_pois.rds")
+```
+
+For my first model, I decided to predict counts of offenses for each season and type while controlling for year and ADI score.
+
+I decided against an offset in favor of examining the relationship of neighborhood density.
+
+```{r}
+AER::dispersiontest(model_pois)
+```
+
+Before even examining the model, I tested a major assumption of Poisson regression regarding dispersion.
+
+This assumption did not hold and while the estimates themselves might be unaffected, the standard errors will be too small resulting in too liberal of confidence intervals and p-values resulting in too much Type I error.
+
+# Model 2. Negative Binomial
+
+If a Poisson model is over-dispersed, a common next step is to try a negative binomial model which adds a parameter to estimate and deal with the dispersion.
+
+```{r}
+if(params$fit) {
+  model_nbinom <- glmmTMB::glmmTMB(
+    offense_count ~ season + year + type + log_density + adi_staternk,
+    crossed_data,
+    glmmTMB::nbinom2()
+  )
+
+  # save cache
+  saveRDS(model_nbinom, "model_nbinom.rds")
+}
+
+# load cache
+model_nbinom <- readRDS("model_nbinom.rds")
+```
+
+# Model 3. Mixed Negative Binomial
+
+But I was interested in trying to account for neighborhoods above and beyond their population densities. Therefore, I fit the same model again but this time with additional random intercept components for each neighborhood.
+
+```{r}
+if(params$fit) {
+  model_nbinom_mixed <- glmmTMB::glmmTMB(
+    offense_count ~ season + year + type + log_density + adi_staternk + (1 | neighborhood),
+    crossed_data,
+    glmmTMB::nbinom2()
+  )
+
+  # save cache
+  saveRDS(model_nbinom_mixed, "model_nbinom_mixed.rds")
+}
+
+# load cache
+model_nbinom_mixed <- readRDS("model_nbinom_mixed.rds")
+```
+
+# Random Effects Test
+
+I then tested if the random components added significantly to the base model with a deviance test, which they did.
+
+```{r}
+anova(model_nbinom_mixed, model_nbinom)
+```
+
+# Model Diagnostics
+
+```{r}
+model_nbinom_mixed_residuals <- DHARMa::simulateResiduals(model_nbinom_mixed)
+```
+
+## QQ Plot
+
+```{r}
+model_nbinom_mixed_residuals %>% 
+  DHARMa::plotQQunif(FALSE, FALSE, FALSE)
+```
+
+The QQ plot compares the observed residuals to theoretically expected ones.
+
+From an applied perspective this plot is not terrible, but it is certainly not ideal.
+
+The deviance from the expected line may indicate model misspecification, but more likely missing variables.
+
+## Residuals vs Predicted
+
+```{r}
+model_nbinom_mixed_residuals %>% 
+  DHARMa::plotResiduals()
+```
+
+This residual plot can help identify problematic predictions. For the most part, the trend is within the inner quartile range.
+
+However, a few outliers are noted which should be further investigated.
+
+## Dispersion
+
+```{r}
+model_nbinom_mixed_residuals %>% 
+  DHARMa::testDispersion()
+```
+
+The test of dispersion is not significant (p = 0.16).
+
+## Zero Inflation
+
+```{r}
+model_nbinom_mixed_residuals %>% 
+  DHARMa::testZeroInflation()
+```
+
+Even though I attempted to account for zero-inflation in the model `ziformula = ~1`, it appears the model is over estimating the number of 0s.
+
+This should be fixed. One solution might be to exclude the numerous parks from the data so that the model is not so biased to 0.
+
+## QQ Plot of Random Effects
+
+```{r}
+(qq <- model_nbinom_mixed %>% 
+  glmmTMB::ranef() %>% 
+  { .$cond$neighborhood } %>% 
+  mutate(
+    intercept = `(Intercept)`,
+    neighborhood = rownames(.),
+    theoretical = qqnorm(intercept, plot.it = FALSE)$x,
+    sample = qqnorm(intercept, plot.it = FALSE)$y
+  ) %>% 
+  ggplot(aes(x = theoretical, y = sample, label = neighborhood)) + 
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+  geom_point() + 
+  labs(
+    title = "QQ Plot Random Effects",
+    x = "Theoretical",
+    y = "Sample"
+  )
+)
+```
+
+Another assumption of the model is that the random effects are normally distributed. This can be examined with a QQ plot of the random effects.
+
+Here we see some issues where some neighborhoods are under predicted while a few are over predicted.
+
+This also warrants further investigation, but my initial reaction is that the parks are contributing to the under prediction.
+
+```{r}
+qq + geom_text()
+```
+
+Adding the labels bears this thought out.
+
+# Model Summary
+
+## Log-Mean
+
+```{r}
+suppressWarnings(
+  sjPlot::tab_model(
+    model_nbinom_mixed, 
+    transform = NULL,
+    show.intercept = FALSE,
+    show.zeroinf = FALSE
+  )
+)
+```
+
+A negative binomial mixed-model regression was conducted to examine the effect of season and offense type on the number of offenses committed per neighborhood while controlling for yearly trend, population density, and area deprivation. Neighborhood was included as a random effect. Results indicated that compared to Summer, the expected log number of offenses was 0.10 lower in Autumn ($\beta$ = -0.10 [-0.15, -0.05], p < .001), 0.18 lower in Winter ($\beta$ = -0.18 [-0.22, -0.13], p < .001), and 0.08 lower in Spring ($\beta$ = -0.08 [-0.13, -0.03], p < .001). For each additional year, the log count of offenses are expected to decrease by 0.12 ($\beta$ = -0.12 [-0.14, -0.09], p < .001). Compared to other offenses, the expected log number of offenses was 1.42 lower for citations ($\beta$ = -1.42 [-1.47, -1.37], p < .001), 0.73 lower for misdemeanors ($\beta$ = -0.73 [-0.78, -0.68], p < .001), and 0.70 higher for felonies ($\beta$ = 0.70 [0.65, 0.74], p < .001). Neighborhood population density and deprivation did not significantly contribute to the model.
+
+## Incident Rate Ratios
+
+```{r}
+suppressWarnings(
+  sjPlot::tab_model(
+    model_nbinom_mixed, 
+    transform = "exp", 
+    show.intercept = FALSE,
+    show.zeroinf = FALSE
+  )
+)
+```
+
+A negative binomial mixed-model regression was conducted to examine the effect of season and offense type on the number of offenses committed per neighborhood while controlling for yearly trend, population density, and area deprivation. Neighborhood was included as a random effect. Results indicated that compared to Summer, the expected number of offenses was 10% lower in Autumn (IRR = 0.90 [0.86, 0.95], p < .001), 16% lower in Winter (IRR = 0.84 [0.80, 0.88], p < .001), and 8% lower in Spring (IRR = 0.92 [0.88, 0.97], p < .001). For each additional year, offenses are expected to decrease by 11% (IRR = 0.89 [0.87, 0.91], p < .001). Compared to other offenses, the expected number of offenses was 76% lower for citations (IRR = 0.24 [0.23, 0.25], p < .001), 52% lower for misdemeanors (IRR = 0.48 [0.46, 0.51], p < .001), and 100% higher for felonies (IRR = 2.00 [1.92, 2.10], p < .001). Neighborhood population density and deprivation did not significantly contribute to the model.
+
+# Model Plots
+
+## Effects
+
+### Fixed Effects
+
+```{r}
+# sjPlot needs to be updated to use a newer ggplot api
+# suppress warning in mean time
+suppressWarnings(
+  model_nbinom_mixed %>% 
+    sjPlot::plot_model("est")
+)
+```
+
+### Random Effects
+
+```{r, fig.height=11}
+model_nbinom_mixed %>% 
+  sjPlot::plot_model("re")
+```
+
+## Marginal Means
+
+### Season
+
+```{r}
+model_nbinom_mixed %>% 
+  sjPlot::plot_model("emm", terms = "season")
+```
+
+```{r}
+crossed_data %>% 
+  group_by(season) %>% 
+  summarize(offense_count = sum(offense_count)) %>% 
+  ggplot(aes(season, offense_count)) + 
+  geom_col() + 
+  labs(title = "Raw Offenses by Season")
+```
+
+### Year
+
+```{r}
+model_nbinom_mixed %>% 
+  sjPlot::plot_model("emm", terms = "year")
+```
+
+```{r}
+crossed_data %>% 
+  group_by(year) %>% 
+  summarize(offense_count = sum(offense_count)) %>% 
+  ggplot(aes(year, offense_count)) + 
+  geom_col() + 
+  labs(title = "Raw Offenses by Year")
+```
+
+### Type
+
+```{r}
+model_nbinom_mixed %>%
+  sjPlot::plot_model("emm", terms = "type")
+```
+
+```{r}
+crossed_data %>% 
+  group_by(type) %>% 
+  summarize(offense_count = sum(offense_count)) %>% 
+  ggplot(aes(type, offense_count)) + 
+  geom_col() + 
+  labs(title = "Raw Offenses by Type")
+```
+
+### Log Density
+
+```{r}
+model_nbinom_mixed %>% 
+  sjPlot::plot_model("emm", terms = "log_density")
+```
+
+```{r}
+crossed_data %>% 
+  ggplot(aes(log_density, offense_count)) + 
+  geom_point() + 
+  labs(title = "Raw Offenses by Log Density")
+```
+
+### ADI
+
+```{r}
+model_nbinom_mixed %>% 
+  sjPlot::plot_model("emm", terms = "adi_staternk")
+```
+
+```{r}
+crossed_data %>% 
+  ggplot(aes(adi_staternk, offense_count)) + 
+  geom_point() + 
+  labs(title = "Raw Offenses by ADI")
+```
+
+## Predictions
+
+```{r}
+pred_plots <- model_nbinom_mixed %>% 
+  sjPlot::plot_model("pred")
+```
+
+### Season
+
+```{r}
+pred_plots[1]
+```
+
+### Year
+
+```{r}
+pred_plots[2]
+```
+
+### Type
+
+```{r}
+pred_plots[3]
+```
+
+### Log Density
+
+```{r}
+pred_plots[4]
+```
+
+### ADI
+
+```{r}
+pred_plots[5]
+```
+
+# Predictions
+
+If the model fit was deemed acceptable, we could also make predictions based on the model.
+
+Here are two examples:
+
+## Low
+
+```{r}
+crossed_data %>% 
+  filter(
+    neighborhood == "Cal-Bel Cemetery",
+    season == "Autumn",
+    year == 2022,
+    type == "C"
+  ) %>% 
+  gt()
+
+new_data <- tibble(
+  neighborhood = "Cal-Bel Cemetery",
+  season = factor("Autumn", levels = c("Summer", "Autumn", "Winter", "Spring")),
+  year = 2022,
+  type = factor("C", levels = c("O", "C", "M", "F")),
+  log_density = 7.398858,
+  adi_staternk = 9.751434
+)
+```
+
+The predicted value is `r model_nbinom_mixed %>% predict(new_data, type = "response") %>% round(2)`.
+
+## High
+
+```{r}
+crossed_data %>% 
+  filter(
+    neighborhood == "Downtown",
+    season == "Summer",
+    year == 2021,
+    type == "F"
+  )
+
+new_data <- tibble(
+  neighborhood = "Downtown",
+  season = factor("Summer", levels = c("Summer", "Autumn", "Winter", "Spring")),
+  year = 2021,
+  type = factor("F", levels = c("O", "C", "M", "F")),
+  log_density = 8.384866,
+  adi_staternk = 4.682408
+)
+```
+
+The predicted value is `r model_nbinom_mixed %>% predict(new_data, type = "response") %>% round(2)`.
+
+# Discussion
+
+The model does not provide an optimal fit and is relatively simplistic in its structure. Predictors are often time-invariant while the model considers a temporal dimension. Neighborhood area calculations do not account for uninhabitable area such as bodies of water which biases the population density calculations. Additionally, modeling at the offense level rather than the incident level may introduce biases, which could affect applications such as personnel assignment decisions.
+
+On the other hand, the model is parsimonious and effectively mirrors trends observed in the raw data. It accounts for overdispersion and incorporates neighborhood-level random effects, enhancing its ability to capture neighborhood-level variability beyond population density and deprivation. By using raw counts without an offset, the model remains straightforward and interpretable. Additionally, it integrates external data sources, including shape files from the City of St. Louis, American Community Survey (ACS) data, and the Area Deprivation Index (ADI), providing valuable contextual information for analysis.
+
+Issues identified in the model diagnostics warrant further examination. Additional predictors, including new data sources, as well as feature engineering with existing variables, should be explored. Further modeling efforts are recommended. Ideally, a hierarchical model with offenses nested within incidents and incidents nested within neighborhoods would be preferable; however, this approach is not feasible due to the large number of incidents. An alternative would be to aggregate offenses to the incident level and model incidents nested within neighborhoods.
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
